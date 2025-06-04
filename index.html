@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Bulk Update App</title>
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.29/"></script>
+  <style>
+    html, body, #viewDiv { height: 100%; margin: 0; padding: 0; }
+    .input-box {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 99;
+      background: white;
+      padding: 10px;
+      border-radius: 6px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.2);
+    }
+    label, input, button { display: block; margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <div id="viewDiv"></div>
+  <div class="input-box">
+    <label for="crew">Install Crew:</label>
+    <input type="text" id="crew" />
+
+    <label for="equipment">Install Equipment:</label>
+    <input type="text" id="equipment" />
+
+    <label for="date">Install Date:</label>
+    <input type="date" id="date" />
+
+    <button id="updateBtn">Update Selected</button>
+  </div>
+
+  <script>
+    require([
+      "esri/Map",
+      "esri/views/MapView",
+      "esri/layers/FeatureLayer",
+      "esri/widgets/Legend",
+      "esri/widgets/Sketch",
+      "esri/layers/GraphicsLayer",
+      "esri/geometry/geometryEngine",
+      "esri/Graphic"
+    ], function(Map, MapView, FeatureLayer, Legend, Sketch, GraphicsLayer, geometryEngine, Graphic) {
+
+      const polygonRenderer = {
+        type: "unique-value",
+        valueExpression: "IIF(IsEmpty($feature.Install_Date), 'Not Installed', 'Installed')",
+        valueExpressionTitle: "Installation Status",
+        uniqueValueInfos: [
+          {
+            value: "Installed",
+            label: "Installed",
+            symbol: { type: "simple-fill", color: "#ccffcc", outline: { color: "#009900" } }
+          },
+          {
+            value: "Not Installed",
+            label: "Not Installed",
+            symbol: { type: "simple-fill", color: "#ffcccc", outline: { color: "#cc0000" } }
+          }
+        ],
+        defaultSymbol: null
+      };
+
+      const polygonLayer = new FeatureLayer({
+        url: "https://services.arcgis.com/ktjR9muzuINkFI2g/arcgis/rest/services/Trackers_Layer_CustomWebTool/FeatureServer/5",
+        outFields: ["*"],
+        renderer: polygonRenderer
+      });
+
+      const pointLayer = new FeatureLayer({
+        url: "https://services.arcgis.com/ktjR9muzuINkFI2g/arcgis/rest/services/Posts_Layer_CustomWebTool/FeatureServer/4",
+        outFields: ["*"],
+        visible: false
+      });
+
+      const selectionGraphics = new GraphicsLayer();
+
+      const map = new Map({
+        basemap: "topo-vector",
+        layers: [polygonLayer, pointLayer, selectionGraphics]
+      });
+
+      const view = new MapView({
+        container: "viewDiv",
+        map: map,
+        zoom: 12
+      });
+
+      polygonLayer.when(() => {
+        polygonLayer.queryExtent().then(function(result) {
+          if (result.extent) {
+            view.goTo(result.extent.expand(1.2));
+          }
+        });
+      });
+
+      const legend = new Legend({
+        view: view,
+        layerInfos: [{ layer: polygonLayer, title: "Installation Status" }]
+      });
+      view.ui.add(legend, "bottom-left");
+
+      const sketch = new Sketch({
+        layer: selectionGraphics,
+        view: view,
+        creationMode: "single",
+        availableCreateTools: ["rectangle", "polygon"],
+        visibleElements: {
+          createTools: { point: false, polyline: false, circle: false },
+          selectionTools: { "lasso-selection": false, "rectangle-selection": false }
+        }
+      });
+      view.ui.add(sketch, "top-right");
+
+      let selectedPolygonGraphics = [];
+
+      sketch.on("create", async (event) => {
+        if (event.state === "complete") {
+          selectionGraphics.removeAll();
+
+          const query = polygonLayer.createQuery();
+          query.geometry = event.graphic.geometry;
+          query.spatialRelationship = "intersects";
+          query.returnGeometry = true;
+          const results = await polygonLayer.queryFeatures(query);
+          selectedPolygonGraphics = results.features;
+
+          selectionGraphics.addMany(results.features.map(f => {
+            return new Graphic({
+              geometry: f.geometry,
+              symbol: {
+                type: "simple-fill",
+                color: [0,0,255,0.1],
+                outline: { color: [0,0,255], width: 2 }
+              }
+            });
+          }));
+        }
+      });
+
+      // ✅ Update with confirmation dialog
+      document.getElementById("updateBtn").addEventListener("click", async () => {
+        const crew = document.getElementById("crew").value;
+        const equipment = document.getElementById("equipment").value;
+
+        const dateInput = document.getElementById("date").value;
+        let date;
+        if (dateInput) {
+          const [year, month, day] = dateInput.split('-').map(Number);
+          date = new Date(Date.UTC(year, month - 1, day, 19, 0)); // 7PM UTC = noon AZ
+        }
+
+        if (!selectedPolygonGraphics.length) {
+          alert("Please select polygons first.");
+          return;
+        }
+
+        const confirmMsg = `Are you sure you want to make edits on ${selectedPolygonGraphics.length} Tracker(s)?`;
+        const proceed = confirm(confirmMsg);
+        if (!proceed) return;
+
+        const polygonEdits = selectedPolygonGraphics.map(f => {
+          f.attributes.Install_Date = date;
+          f.attributes.Install_Crew = crew;
+          f.attributes.Install_Equipment = equipment;
+          return f;
+        });
+        await polygonLayer.applyEdits({ updateFeatures: polygonEdits });
+
+        const unionedGeom = geometryEngine.union(selectedPolygonGraphics.map(f => f.geometry));
+        const pointQuery = pointLayer.createQuery();
+        pointQuery.geometry = unionedGeom;
+        pointQuery.spatialRelationship = "intersects";
+        pointQuery.returnGeometry = false;
+
+        const pointResults = await pointLayer.queryFeatures(pointQuery);
+        const pointEdits = pointResults.features.map(p => {
+          p.attributes.Install_Date = date;
+          p.attributes.Install_Crew = crew;
+          p.attributes.Install_Equipment = equipment;
+          return p;
+        });
+
+        if (pointEdits.length) {
+          await pointLayer.applyEdits({ updateFeatures: pointEdits });
+        }
+
+        polygonLayer.refresh();
+        alert("✅ Updates complete!");
+        selectionGraphics.removeAll();
+        selectedPolygonGraphics = [];
+      });
+    });
+  </script>
+</body>
+</html>
